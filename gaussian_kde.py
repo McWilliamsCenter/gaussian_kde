@@ -179,12 +179,6 @@ class gaussian_kde(scipy_gaussian_kde):
 
         x = np.atleast_1d(x)
         c = np.atleast_1d(c)
-
-        if np.shape(x)[0] != np.shape(c)[0]:
-            msg = ('The number of conditional dimensions must equal \n'
-                   'to the dimension of the samples in `x`.')
-            raise ValueError(msg)
-
         size = len(x)
 
         if x.ndim == 1:
