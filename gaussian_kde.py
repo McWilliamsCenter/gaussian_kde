@@ -1,200 +1,225 @@
 """
-A class for (uni/multi)-variate Gaussian kernel density estimation with added methods for conditional sampling.
+custom implementation of kde for conditional sampling
+of multidimensional distributions
 """
 
 from __future__ import division, print_function, absolute_import
-
-from scipy.stats import gaussian_kde as scipy_gaussian_kde
-from scipy.stats import multivariate_normal
-
 import numpy as np
+from scipy.stats import gaussian_kde as scipy_gaussian_kde
+from numpy.random import multivariate_normal
+# The scipy KDTree does not allow for 'seuclidean' distance metric
+# so we will use the BallTree class instead.
+from sklearn.neighbors import BallTree
+import warnings
 
-__all__=['gaussian_kde']
-__author__ = ['Duncan Campbell']
+__all__ = ('gaussian_kde')
+__author__ = ('Duncan Campbell')
+
 
 class gaussian_kde(scipy_gaussian_kde):
     """
+    a gaussian kde class with an additional method to allow
+    for approximate conditional sampling of the pdf based on
+    the scipy.stats.gaussian_kde class
+
+    Representation of a kernel-density estimate using Gaussian kernels.
+    Kernel density estimation is a way to estimate the probability density
+    function (PDF) of a random variable in a non-parametric way.
+    `gaussian_kde` works for both uni-variate and multi-variate data.   It
+    includes automatic bandwidth determination.  The estimation works best for
+    a unimodal distribution; bimodal or multi-modal distributions tend to be
+    oversmoothed.
+
+    Parameters
+    ----------
+    dataset : array_like
+        Datapoints to estimate from. In case of univariate data this is a 1-D
+        array, otherwise a 2-D array with shape (# of dims, # of data).
+    bw_method : str, scalar or callable, optional
+        The method used to calculate the estimator bandwidth.  This can be
+        'scott', 'silverman', a scalar constant or a callable.  If a scalar,
+        this will be used directly as `kde.factor`.  If a callable, it should
+        take a `gaussian_kde` instance as only parameter and return a scalar.
+        If None (default), 'scott' is used.  See Notes for more details.
+
+    Attributes
+    ----------
+    dataset : ndarray
+        The dataset with which `gaussian_kde` was initialized.
+
+    d : int
+        Number of dimensions.
+
+    n : int
+        Number of datapoints.
+
+    factor : float
+        The bandwidth factor, obtained from `kde.covariance_factor`, with which
+        the covariance matrix is multiplied.
+
+    covariance : ndarray
+        The covariance matrix of `dataset`, scaled by the calculated bandwidth
+        (`kde.factor`).
+
+    inv_cov : ndarray
+        The inverse of `covariance`.
+
+    Methods
+    -------
+    evaluate
+    __call__
+    integrate_gaussian
+    integrate_box_1d
+    integrate_box
+    integrate_kde
+    pdf
+    logpdf
+    resample
+    set_bandwidth
+    covariance_factor
+    conditional_sample
+
+    Notes
+    -----
+    Bandwidth selection strongly influences the estimate obtained from the KDE
+    (much more so than the actual shape of the kernel).  Bandwidth selection
+    can be done by a "rule of thumb", by cross-validation, by "plug-in
+    methods" or by other means; see [3]_, [4]_ for reviews.  `gaussian_kde`
+    uses a rule of thumb, the default is Scott's Rule.
+    Scott's Rule [1]_, implemented as `scotts_factor`, is::
+        n**(-1./(d+4)),
+    with ``n`` the number of data points and ``d`` the number of dimensions.
+    Silverman's Rule [2]_, implemented as `silverman_factor`, is::
+        (n * (d + 2) / 4.)**(-1. / (d + 4)).
+    Good general descriptions of kernel density estimation can be found in [1]_
+    and [2]_, the mathematics for this multi-dimensional implementation can be
+    found in [1]_.
+
+    References
+    ----------
+    .. [1] D.W. Scott, "Multivariate Density Estimation: Theory, Practice, and
+           Visualization", John Wiley & Sons, New York, Chicester, 1992.
+    .. [2] B.W. Silverman, "Density Estimation for Statistics and Data
+           Analysis", Vol. 26, Monographs on Statistics and Applied Probability,
+           Chapman and Hall, London, 1986.
+    .. [3] B.A. Turlach, "Bandwidth Selection in Kernel Density Estimation: A
+           Review", CORE and Institut de Statistique, Vol. 19, pp. 1-33, 1993.
+    .. [4] D.M. Bashtannyk and R.J. Hyndman, "Bandwidth selection for kernel
+           conditional density estimation", Computational Statistics & Data
+           Analysis, Vol. 36, pp. 279-298, 2001.
+
+    Examples
+    --------
+    Generate some random two-dimensional data:
+
+    >>> from scipy import stats
+    >>> def measure(n):
+    ...     "Measurement model, return two coupled measurements."
+    ...     m1 = np.random.normal(size=n)
+    ...     m2 = np.random.normal(scale=0.5, size=n)
+    ...     return m1+m2, m1-m2
+    >>> m1, m2 = measure(2000)
+    >>> xmin = m1.min()
+    >>> xmax = m1.max()
+    >>> ymin = m2.min()
+    >>> ymax = m2.max()
+
+    Perform a kernel density estimate on the data:
+
+    >>> X, Y = np.mgrid[xmin:xmax:100j, ymin:ymax:100j]
+    >>> positions = np.vstack([X.ravel(), Y.ravel()])
+    >>> values = np.vstack([m1, m2])
+    >>> kernel = stats.gaussian_kde(values)
+    >>> Z = np.reshape(kernel(positions).T, X.shape)
+
+    Plot the results:
+
+    >>> import matplotlib.pyplot as plt
+    >>> fig, ax = plt.subplots()
+    >>> ax.imshow(np.rot90(Z), cmap=plt.cm.gist_earth_r,
+    ...           extent=[xmin, xmax, ymin, ymax])
+    >>> ax.plot(m1, m2, 'k.', markersize=2)
+    >>> ax.set_xlim([xmin, xmax])
+    >>> ax.set_ylim([ymin, ymax])
+    >>> plt.show()
     """
+
     def __init__(self, dataset, bw_method=None):
         """
         """
-
-        self.dataset = np.atleast_2d(dataset)
-        if not self.dataset.size > 1:
-            raise ValueError("`dataset` input should have multiple elements.")
-
         super(gaussian_kde, self).__init__(dataset, bw_method=bw_method)
 
-    def conditional_resample(self, cx, c, size=None):
+    def conditional_sample(self, x, c):
         """
-        Perform a conditional random sampling from the estimated pdf given a set of values to condition on.
+        Return random samples from the distribution :math:`P(y|x)`,
+        where :math:`x` and :math:`y` are subsets of the full N-dimensional
+        space of the pdf obtained from KDE.  Here :math:`x` is assumed to
+        have dimension q and :math:`y` N-q.
 
         Parameters
-        ==========
-        cx : array_like
-             a vector of length Nc specifying the values of the independant variables.
+        ----------
+        x : array_like
+            an array of dependent variables of shape (q, n_samples)
 
         c : array_like
-            a boolean vector indicating the dimensions of the independant variables.
-
-        size : int, optional
-            The number of samples to draw.  If not provided, then the size is
-            the same as the underlying dataset.
+            boolean array defining the conditional dimensions.
+            the shape must be (N,)
 
         Returns
-        =======
-        resample : (self.d, `size`) ndarray
-            The sampled dataset.
+        -------
+        y : numpy.array
+            array of sampled values of shape (N-q, n_samples)
+
+        Notes
+        -----
+        This is only an approximate method.  A more robust method
+        would be to calculate the full conditional distribution for
+        each `x` using a different KDE method.
         """
 
-        if size is None:
-            size = self.n
-
-        dists = map(lambda x: multivariate_normal(x, self.covariance), self.dataset.T)  # list of mvns
-
-        # get marginalized (over the not conditioned dimensions)
-        mps = [self.marginalized_multivariate_normal(p, ~c) for p in dists]
-        # evaulate each marginalized distribution at cx
-        norms = np.array([mp.pdf(cx) for mp in mps])
-        norms = norms/np.sum(norms)  # normalize
-        #norms = norms*0.0 + 1.0/len(norms)
-
-        # get list of conditional distributions for each point
-        cdists = np.array([self._conditional_multivariate_gaussian(dist, cx, c) for dist in dists])
-
-        # get a random number for each sampled point
-        ran_num = np.random.random(size=size)
-
-        # sort distributions by contribution at cx
-        sort_inds = np.argsort(norms)
-        norms = norms[sort_inds]
-        cdists = cdists[sort_inds]
-
-        self.cdists = np.copy(cdists)
-        self.norms = np.copy(norms)
-
-        # choose a distribution to sample from
-        inds = np.searchsorted(norms, ran_num)-1
-        #inds = range(0, len(cdists))
-        self.sinds = inds
-
-        # sample from selected distributions
-        s = [dist.rvs() for dist in cdists[inds]]
-
-        return s
-
-    def _conditional_multivariate_gaussian(self, p, cx, c):
-        """
-        Given a multivariate Gaussian distribution, return a new conditional (uni/multi)-variate Gaussian.
-
-        Parameters
-        ==========
-        p : scipy.stats.multivariate_normal object
-            A multivariate normal random variable.
-
-        cx : array_like
-            a vector of length Nc specifying the values of the independant variables.
-
-        c : array_like
-            a boolean vector indicating the dimensions of the independant variables.
-
-        Returns
-        =======
-        cp : scipy.stats.multivariate_normal
-            A multivariate normal random variable.
-        """
-
-        cx = np.atleast_1d(cx)
+        x = np.atleast_1d(x)
         c = np.atleast_1d(c)
 
-        mus = np.atleast_1d(p.mean)
-        cov = np.atleast_1d(p.cov)
+        if np.shape(x)[0] != np.shape(c)[0]:
+            msg = ('The number of conditional dimensions must equal \n'
+                   'to the dimension of the samples in `x`.')
+            raise ValueError(msg)
 
-        # seperate components
-        # means
-        mu1 = mus[~c]
-        mu2 = mus[c]
+        size = len(x)
 
-        # covariance matrices
-        mask11 = np.ix_(~c, ~c)
-        cov11 = cov[mask11]
-        mask12 = np.ix_(~c, c)
-        cov12 = cov[mask12]
-        mask21 = np.ix_(c, ~c)
-        cov21 = cov[mask21]
-        mask22 = np.ix_(c, c)
-        cov22 = cov[mask22]
+        if x.ndim == 1:
+            x = x[..., np.newaxis]
 
-        # number of dimensions for conditional distribution
-        ndim = np.sum(~c)
+        # find the nearest neighbor to each x.
+        V = np.diagonal(self.covariance)
+        d = self.dataset.T
+        tree = BallTree(d[:, c], metric='seuclidean', V=V[c])
 
-        # calculate new parmaters for distribution
-        mu_bar = mu1 + cov12*np.linalg.inv(cov22)*(np.matrix(cx - mu2).reshape(ndim, 1))
-        cov_bar = cov11 - cov12*np.linalg.inv(cov22)*cov21
+        # add a random variable to each x.
+        mask = np.ix_(c, c)
+        cov_xx = np.atleast_2d(self.covariance[mask])
+        dim_x = np.sum(c)
+        x = x + multivariate_normal(np.zeros((dim_x,), float),
+                                    cov_xx, size=size)
 
-        return multivariate_normal(mean=mu_bar, cov=cov_bar)
+        # return index into training sample and the normalized distance.
+        d, indices = tree.query(x, k=1, return_distance=True)
 
-    def evaluate_marginalized(self, points, m):
-        """
-        """
-        dists = map(lambda x: multivariate_normal(x, self.covariance), self.dataset.T)
+        # if the training dataset does not span the range of `x`,
+        # then this may not be the best algorithm to use.
+        if np.max(d) > 3.0:
+            msg = ("Training dataset may not be suffucient \n"
+                   "to sample over the range of `x`. \n"
+                   "The maximum normalzed distance is: {0}".format(np.max(d)))
+            warnings.warn(msg)
 
-        # get marginalized (over the not conditioned dimensions)
-        mps = [self.marginalized_multivariate_normal(p, ~c) for p in dists]
+        # for each matched point in the training dataset
+        # add a random variable get a sample for y.
+        mask = np.ix_(~c, ~c)
+        cov_yy = np.atleast_2d(self.covariance[mask])
+        dim_y = self.d - np.sum(c)
+        norm = multivariate_normal(np.zeros((dim_y,), float),
+                                   cov_yy, size=size)
+        means = self.dataset[~c, indices]
 
-        points = np.atleast_2d(points)
-
-        d, m = points.shape
-        if d != self.d:
-            if d == 1 and m == self.d:
-                # points was passed in as a row vector
-                points = np.reshape(points, (self.d, 1))
-                m = 1
-            else:
-                msg = "points have dimension %s, dataset has dimension %s" % (d, self.d)
-                raise ValueError(msg)
-
-        result = np.zeros((m,), dtype=float)
-
-        if m >= self.n:
-            # there are more points than data, so loop over data
-            for i in range(self.n):
-                diff = self.dataset[:, i, np.newaxis] - points
-                tdiff = np.dot(self.inv_cov, diff)
-                energy = sum(diff*tdiff, axis=0) / 2.0
-                result = result + np.exp(-energy)
-        else:
-            # loop over points
-            for i in range(m):
-                diff = self.dataset - points[:, i, np.newaxis]
-                tdiff = np.dot(self.inv_cov, diff)
-                energy = sum(diff * tdiff, axis=0) / 2.0
-                result[i] = sum(np.exp(-energy), axis=0)
-
-        result = result / self._norm_factor
-
-        return result
-
-    def marginalized_multivariate_normal(self, p, m):
-        """
-        marginalize over a set of dimensions of a multivariate normal
-        """
-        m = np.atleast_1d(m)
-
-        mus = np.atleast_1d(p.mean)
-        cov = np.atleast_1d(p.cov)
-
-        # seperate components
-        # means
-        mu_bar = mus[~m]
-
-        # covariance matrices
-        mask = np.ix_(~m, ~m)
-        cov_bar = cov[mask]
-
-        return multivariate_normal(mean=mu_bar, cov=cov_bar)
-
-
-
-
-
+        return means + norm
